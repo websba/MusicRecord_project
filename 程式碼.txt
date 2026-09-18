@@ -1,0 +1,2333 @@
+系統音訊錄音／錄影  程式碼彙整
+一個檔案一個章節；含執行原始碼與 tests（不含 env、backup）。
+
+目錄
+  第一章  main.py  （程式進入點）  [main.py]
+  第二章  main.bat  （Windows 啟動）  [main.bat]
+  第三章  requirements.txt  （依賴套件）  [requirements.txt]
+  第四章  music_recorder/__init__.py  （套件版本）  [music_recorder/__init__.py]
+  第五章  music_recorder/app.py  （視窗介面）  [music_recorder/app.py]
+  第六章  music_recorder/devices.py  （播放裝置與 loopback）  [music_recorder/devices.py]
+  第七章  music_recorder/capture.py  （系統音訊擷取）  [music_recorder/capture.py]
+  第八章  music_recorder/encoder.py  （MP3／WAV 編碼）  [music_recorder/encoder.py]
+  第九章  music_recorder/ffmpeg_bin.py  （FFmpeg 指令）  [music_recorder/ffmpeg_bin.py]
+  第十章  music_recorder/screen.py  （螢幕錄影）  [music_recorder/screen.py]
+  第十一章  tests/test_app_logic.py  （介面與存檔流程測試）  [tests/test_app_logic.py]
+  第十二章  tests/test_devices.py  （播放裝置測試）  [tests/test_devices.py]
+  第十三章  tests/test_capture.py  （音訊擷取測試）  [tests/test_capture.py]
+  第十四章  tests/test_encoder.py  （編碼測試）  [tests/test_encoder.py]
+  第十五章  tests/test_ffmpeg_bin.py  （FFmpeg 指令測試）  [tests/test_ffmpeg_bin.py]
+  第十六章  tests/test_screen.py  （螢幕錄影測試）  [tests/test_screen.py]
+
+========================================================================
+第一章  main.py  （程式進入點）
+檔案：main.py
+========================================================================
+
+"""Entry point for the system audio recorder UI."""
+
+from music_recorder.app import run_app
+
+
+if __name__ == "__main__":
+    run_app()
+
+========================================================================
+第二章  main.bat  （Windows 啟動）
+檔案：main.bat
+========================================================================
+
+.\env\Scripts\python.exe main.py
+
+========================================================================
+第三章  requirements.txt  （依賴套件）
+檔案：requirements.txt
+========================================================================
+
+customtkinter>=5.2.0
+PyAudioWPatch>=0.2.12.6
+numpy>=1.24.0
+lameenc>=1.7.0
+imageio-ffmpeg>=0.5.0
+mss>=9.0.0
+pytest>=8.0.0
+
+========================================================================
+第四章  music_recorder/__init__.py  （套件版本）
+檔案：music_recorder/__init__.py
+========================================================================
+
+"""System audio recorder: capture default playback output to MP3."""
+
+__version__ = "1.0.0"
+
+========================================================================
+第五章  music_recorder/app.py  （視窗介面）
+檔案：music_recorder/app.py
+========================================================================
+
+"""customtkinter UI for system audio recording and screen capture."""
+
+from __future__ import annotations
+
+import threading
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from typing import Callable, List, Optional
+
+import customtkinter as ctk
+import numpy as np
+
+from music_recorder.capture import LoopbackRecorder
+from music_recorder.devices import get_default_playback_device
+from music_recorder.encoder import save_mp3
+from music_recorder.screen import ScreenRecorder
+
+
+def default_output_dir() -> Path:
+    return Path.home() / "Desktop"
+
+
+def default_downloads_dir() -> Path:
+    """Alias kept for older call sites; default output is the Desktop."""
+    return default_output_dir()
+
+
+def format_elapsed(seconds: float) -> str:
+    total = int(max(0, seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def default_filename(now: Optional[datetime] = None) -> str:
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"recording_{stamp}.mp3"
+
+
+class RecorderApp(ctk.CTk):
+    """Main window: audio record / screen record / timer / save."""
+
+    def __init__(
+        self,
+        recorder: Optional[LoopbackRecorder] = None,
+        ask_save_path: Optional[Callable[[str, Path], Optional[str]]] = None,
+        output_dir: Optional[Path] = None,
+        downloads_dir: Optional[Path] = None,
+        screen_recorder: Optional[ScreenRecorder] = None,
+    ) -> None:
+        super().__init__()
+        self.title("系統音訊錄音／錄影")
+        self.geometry("420x400")
+        self.minsize(380, 360)
+
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+
+        self._recorder = recorder or LoopbackRecorder()
+        self._ask_save_path = ask_save_path or self._dialog_save_path
+        self._output_dir = output_dir or downloads_dir or default_output_dir()
+        self._screen = screen_recorder
+        self._tick_job: Optional[str] = None
+        self._busy = False
+        self._stop_result: Optional[tuple[Optional[np.ndarray], Optional[BaseException]]] = None
+        self._stop_result_lock = threading.Lock()
+        self._screen_stop_result: Optional[tuple[Optional[List[Path]], Optional[BaseException]]] = None
+
+        self._build_ui()
+        self._refresh_device_label()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            self,
+            text="系統音訊錄音／錄影",
+            font=ctk.CTkFont(size=22, weight="bold"),
+        )
+        title.grid(row=0, column=0, padx=24, pady=(24, 8), sticky="w")
+
+        hint = ctk.CTkLabel(
+            self,
+            text="錄音擷取播放裝置；螢幕錄影含多螢幕與系統音訊，每小時存到桌面",
+            font=ctk.CTkFont(size=13),
+            text_color=("gray40", "gray65"),
+            wraplength=360,
+            justify="left",
+        )
+        hint.grid(row=1, column=0, padx=24, pady=(0, 12), sticky="w")
+
+        self.device_label = ctk.CTkLabel(
+            self,
+            text="目前裝置：—",
+            font=ctk.CTkFont(size=13),
+            anchor="w",
+        )
+        self.device_label.grid(row=2, column=0, padx=24, pady=(0, 8), sticky="ew")
+
+        self.timer_label = ctk.CTkLabel(
+            self,
+            text="00:00",
+            font=ctk.CTkFont(size=48, weight="bold"),
+        )
+        self.timer_label.grid(row=3, column=0, padx=24, pady=12)
+
+        self.status_label = ctk.CTkLabel(
+            self,
+            text="就緒",
+            font=ctk.CTkFont(size=13),
+            text_color=("gray40", "gray65"),
+        )
+        self.status_label.grid(row=4, column=0, padx=24, pady=(0, 16), sticky="w")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.grid(row=5, column=0, padx=24, pady=(0, 8), sticky="ew")
+        btn_row.grid_columnconfigure((0, 1), weight=1)
+
+        self.record_btn = ctk.CTkButton(
+            btn_row,
+            text="錄音",
+            height=40,
+            command=self.start_recording,
+            fg_color="#c0392b",
+            hover_color="#a93226",
+        )
+        self.record_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+
+        self.stop_btn = ctk.CTkButton(
+            btn_row,
+            text="停止",
+            height=40,
+            command=self.stop_recording,
+            state="disabled",
+        )
+        self.stop_btn.grid(row=0, column=1, padx=(8, 0), sticky="ew")
+
+        screen_row = ctk.CTkFrame(self, fg_color="transparent")
+        screen_row.grid(row=6, column=0, padx=24, pady=(0, 24), sticky="ew")
+        screen_row.grid_columnconfigure((0, 1), weight=1)
+
+        self.screen_record_btn = ctk.CTkButton(
+            screen_row,
+            text="螢幕錄影",
+            height=40,
+            command=self.start_screen_recording,
+        )
+        self.screen_record_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+
+        self.screen_stop_btn = ctk.CTkButton(
+            screen_row,
+            text="停止",
+            height=40,
+            command=self.stop_screen_recording,
+            state="disabled",
+        )
+        self.screen_stop_btn.grid(row=0, column=1, padx=(8, 0), sticky="ew")
+
+    def _dialog_save_path(self, initial_name: str, initial_dir: Path) -> Optional[str]:
+        initial_dir.mkdir(parents=True, exist_ok=True)
+        return filedialog.asksaveasfilename(
+            parent=self,
+            title="儲存錄音",
+            defaultextension=".mp3",
+            filetypes=[("MP3 音訊", "*.mp3"), ("所有檔案", "*.*")],
+            initialdir=str(initial_dir),
+            initialfile=initial_name,
+        )
+
+    def _ensure_screen(self) -> ScreenRecorder:
+        if self._screen is None:
+            self._screen = ScreenRecorder(
+                recorder=self._recorder,
+                output_dir=self._output_dir,
+                on_segment_done=self._on_segment_done,
+            )
+        elif getattr(self._screen, "on_segment_done", None) is None:
+            self._screen.on_segment_done = self._on_segment_done
+        return self._screen
+
+    def _screen_is_recording(self) -> bool:
+        return self._screen is not None and bool(self._screen.is_recording)
+
+    def _on_segment_done(
+        self,
+        path: Optional[Path],
+        error: Optional[BaseException],
+    ) -> None:
+        def apply() -> None:
+            if error is not None:
+                self.status_label.configure(text="該段存檔失敗")
+                messagebox.showerror("螢幕錄影", str(error), parent=self)
+                return
+            if path is None:
+                return
+            if self._screen_is_recording():
+                self.status_label.configure(text=f"錄影中… 已儲存：{path.name}")
+            else:
+                self.status_label.configure(text=f"已儲存：{path.name}")
+
+        try:
+            self.after(0, apply)
+        except Exception:
+            pass
+
+    def _refresh_device_label(self) -> None:
+        # Avoid calling WASAPI from the UI thread while capturing;
+        # COM/WASAPI multi-thread use can crash the process on Windows.
+        if self._recorder.is_recording:
+            name = self._recorder.device_name or "錄音中…"
+        else:
+            try:
+                name = get_default_playback_device().name
+            except Exception:
+                name = "無法偵測"
+        self.device_label.configure(text=f"目前裝置：{name}")
+
+    def _set_idle_buttons(self) -> None:
+        self.record_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.screen_record_btn.configure(state="normal")
+        self.screen_stop_btn.configure(state="disabled")
+
+    def start_recording(self) -> None:
+        if self._busy or self._recorder.is_recording or self._screen_is_recording():
+            return
+        try:
+            device_name = self._recorder.start()
+        except Exception as exc:
+            messagebox.showerror("無法開始錄音", str(exc), parent=self)
+            return
+
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.screen_record_btn.configure(state="disabled")
+        self.screen_stop_btn.configure(state="disabled")
+        self.status_label.configure(text="錄音中…")
+        self.device_label.configure(text=f"目前裝置：{device_name}")
+        self.timer_label.configure(text="00:00")
+        self._schedule_tick()
+
+    def stop_recording(self) -> None:
+        if self._busy or self._screen_is_recording() or not self._recorder.is_recording:
+            return
+        self._busy = True
+        self.stop_btn.configure(state="disabled")
+        self.status_label.configure(text="處理中…")
+        self._cancel_tick()
+
+        with self._stop_result_lock:
+            self._stop_result = None
+
+        def worker() -> None:
+            pcm: Optional[np.ndarray] = None
+            error: Optional[BaseException] = None
+            try:
+                pcm = self._recorder.stop()
+            except BaseException as exc:  # noqa: BLE001
+                error = exc
+            with self._stop_result_lock:
+                self._stop_result = (pcm, error)
+
+        threading.Thread(target=worker, name="stop-encode", daemon=True).start()
+        self._poll_stop_result()
+
+    def start_screen_recording(self) -> None:
+        if self._busy or self._recorder.is_recording or self._screen_is_recording():
+            return
+        screen = self._ensure_screen()
+        try:
+            device_name = screen.start()
+        except Exception as exc:
+            messagebox.showerror("無法開始螢幕錄影", str(exc), parent=self)
+            return
+
+        self.record_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.screen_record_btn.configure(state="disabled")
+        self.screen_stop_btn.configure(state="normal")
+        self.status_label.configure(text="螢幕錄影中…")
+        self.device_label.configure(text=f"目前裝置：{device_name}")
+        self.timer_label.configure(text="00:00")
+        self._schedule_tick()
+
+    def stop_screen_recording(self) -> None:
+        if self._busy or not self._screen_is_recording():
+            return
+        self._busy = True
+        self.screen_stop_btn.configure(state="disabled")
+        self.status_label.configure(text="處理中…")
+        self._cancel_tick()
+
+        with self._stop_result_lock:
+            self._screen_stop_result = None
+
+        def worker() -> None:
+            paths: Optional[List[Path]] = None
+            error: Optional[BaseException] = None
+            try:
+                assert self._screen is not None
+                paths = self._screen.stop()
+            except BaseException as exc:  # noqa: BLE001
+                error = exc
+            with self._stop_result_lock:
+                self._screen_stop_result = (paths, error)
+
+        threading.Thread(target=worker, name="stop-screen", daemon=True).start()
+        self._poll_screen_stop_result()
+
+    def _poll_stop_result(self) -> None:
+        with self._stop_result_lock:
+            result = self._stop_result
+            if result is not None:
+                self._stop_result = None
+            else:
+                result = None
+
+        if result is not None:
+            pcm, error = result
+            self._after_stop(pcm, error)
+            return
+
+        if self._busy:
+            self.after(50, self._poll_stop_result)
+
+    def _poll_screen_stop_result(self) -> None:
+        with self._stop_result_lock:
+            result = self._screen_stop_result
+            if result is not None:
+                self._screen_stop_result = None
+            else:
+                result = None
+
+        if result is not None:
+            paths, error = result
+            self._after_screen_stop(paths, error)
+            return
+
+        if self._busy:
+            self.after(50, self._poll_screen_stop_result)
+
+    def _after_stop(
+        self,
+        pcm: Optional[np.ndarray],
+        error: Optional[BaseException],
+    ) -> None:
+        self._busy = False
+        self._set_idle_buttons()
+        self._refresh_device_label()
+
+        if error is not None:
+            self.status_label.configure(text="錄音失敗")
+            messagebox.showerror("錄音失敗", str(error), parent=self)
+            return
+
+        if pcm is None or pcm.size == 0:
+            self.status_label.configure(text="沒有錄到音訊")
+            messagebox.showwarning(
+                "沒有音訊",
+                "沒有錄到任何聲音。請確認電腦正在播放音樂後再試。",
+                parent=self,
+            )
+            return
+
+        path = self._ask_save_path(default_filename(), self._output_dir)
+        if not path:
+            self.status_label.configure(text="已取消存檔")
+            return
+
+        try:
+            save_mp3(path, pcm, self._recorder.samplerate)
+        except Exception as exc:
+            self.status_label.configure(text="存檔失敗")
+            messagebox.showerror("存檔失敗", str(exc), parent=self)
+            return
+
+        self.status_label.configure(text=f"已儲存：{Path(path).name}")
+        self.timer_label.configure(text="00:00")
+
+    def _after_screen_stop(
+        self,
+        paths: Optional[List[Path]],
+        error: Optional[BaseException],
+    ) -> None:
+        self._busy = False
+        self._set_idle_buttons()
+        self._refresh_device_label()
+        self.timer_label.configure(text="00:00")
+
+        if error is not None:
+            self.status_label.configure(text="螢幕錄影失敗")
+            messagebox.showerror("螢幕錄影失敗", str(error), parent=self)
+            return
+
+        saved = [p for p in (paths or []) if p is not None]
+        if not saved:
+            self.status_label.configure(text="沒有錄到畫面")
+            messagebox.showwarning(
+                "沒有畫面",
+                "沒有產生錄影檔。請再試一次。",
+                parent=self,
+            )
+            return
+
+        if len(saved) == 1:
+            self.status_label.configure(text=f"已儲存：{saved[0].name}")
+        else:
+            self.status_label.configure(text=f"已儲存 {len(saved)} 個檔案到桌面")
+
+    def _schedule_tick(self) -> None:
+        self._cancel_tick()
+        self._tick()
+
+    def _tick(self) -> None:
+        screen_on = self._screen_is_recording()
+        audio_on = self._recorder.is_recording
+        if not screen_on and not audio_on:
+            return
+        if screen_on and self._screen is not None:
+            seconds = self._screen.elapsed_seconds
+        else:
+            seconds = self._recorder.elapsed_seconds
+        self.timer_label.configure(text=format_elapsed(seconds))
+        name = self._recorder.device_name
+        if name:
+            self.device_label.configure(text=f"目前裝置：{name}")
+        self._tick_job = self.after(200, self._tick)
+
+    def _cancel_tick(self) -> None:
+        if self._tick_job is not None:
+            try:
+                self.after_cancel(self._tick_job)
+            except Exception:
+                pass
+            self._tick_job = None
+
+    def _on_close(self) -> None:
+        self._cancel_tick()
+        try:
+            if self._screen_is_recording() and self._screen is not None:
+                self._screen.stop()
+            elif self._recorder.is_recording or self._busy:
+                self._recorder.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+
+def run_app() -> None:
+    app = RecorderApp()
+    app.mainloop()
+
+========================================================================
+第六章  music_recorder/devices.py  （播放裝置與 loopback）
+檔案：music_recorder/devices.py
+========================================================================
+
+"""Query the current default playback device and its WASAPI loopback."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class PlaybackDevice:
+    """Default output device and matching loopback endpoint."""
+
+    name: str
+    output_index: int
+    loopback_index: int
+    samplerate: int
+    channels: int
+
+
+def get_default_playback_device(pa: Any = None) -> PlaybackDevice:
+    """Return loopback info for the current default WASAPI output device.
+
+    Args:
+        pa: Optional open ``PyAudio`` instance. If omitted, a temporary
+            instance is created and terminated before returning.
+    """
+    import pyaudiowpatch as pyaudio  # type: ignore
+
+    owns_instance = False
+    if pa is None:
+        pa = pyaudio.PyAudio()
+        owns_instance = True
+    try:
+        return _resolve_default(pa, pyaudio)
+    finally:
+        if owns_instance:
+            pa.terminate()
+
+
+def _resolve_default(pa: Any, pyaudio_mod: Any) -> PlaybackDevice:
+    try:
+        wasapi = pa.get_host_api_info_by_type(pyaudio_mod.paWASAPI)
+    except Exception as exc:
+        raise RuntimeError("此系統沒有可用的 WASAPI 音訊介面。") from exc
+
+    out_index = wasapi.get("defaultOutputDevice")
+    if out_index is None or int(out_index) < 0:
+        raise RuntimeError("找不到預設播放裝置。")
+
+    output = pa.get_device_info_by_index(int(out_index))
+    loopback = _find_loopback(pa, output["name"])
+    if loopback is None:
+        raise RuntimeError(f"找不到播放裝置的迴路擷取來源：{output['name']}")
+
+    channels = max(1, min(2, int(loopback.get("maxInputChannels") or 2)))
+    samplerate = int(loopback.get("defaultSampleRate") or 48000)
+    return PlaybackDevice(
+        name=output["name"],
+        output_index=int(out_index),
+        loopback_index=int(loopback["index"]),
+        samplerate=samplerate,
+        channels=channels,
+    )
+
+
+def _find_loopback(pa: Any, output_name: str) -> Optional[dict]:
+    candidates = list(pa.get_loopback_device_info_generator())
+    for device in candidates:
+        name = device.get("name") or ""
+        bare = name.replace(" [Loopback]", "")
+        if output_name == bare or output_name in name:
+            return device
+    for device in candidates:
+        name = device.get("name") or ""
+        bare = name.replace(" [Loopback]", "")
+        if bare in output_name:
+            return device
+    return None
+
+========================================================================
+第七章  music_recorder/capture.py  （系統音訊擷取）
+檔案：music_recorder/capture.py
+========================================================================
+
+"""WASAPI loopback capture via PyAudioWPatch with default-device following."""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, Callable, List, Optional
+
+import numpy as np
+
+from music_recorder.devices import PlaybackDevice, get_default_playback_device
+
+DEFAULT_SAMPLERATE = 48000
+DEFAULT_CHANNELS = 2
+DEVICE_POLL_INTERVAL_SEC = 1.0
+FRAMES_PER_BUFFER = 2048
+
+
+class LoopbackRecorder:
+    """Capture system audio from the current default playback device.
+
+    All PortAudio/WASAPI access stays on one dedicated capture thread.
+    """
+
+    def __init__(
+        self,
+        samplerate: int = DEFAULT_SAMPLERATE,
+        channels: int = DEFAULT_CHANNELS,
+        poll_interval: float = DEVICE_POLL_INTERVAL_SEC,
+        pyaudio_module: Any = None,
+        device_resolver: Optional[Callable[[Any], PlaybackDevice]] = None,
+        keep_chunks: bool = True,
+        chunk_sink: Optional[Callable[[np.ndarray], None]] = None,
+    ) -> None:
+        self.samplerate = samplerate
+        self.channels = channels
+        self.poll_interval = poll_interval
+        self.keep_chunks = keep_chunks
+        self.chunk_sink = chunk_sink
+        self._pyaudio_module = pyaudio_module
+        self._device_resolver = device_resolver
+
+        self._lock = threading.Lock()
+        self._chunks: List[np.ndarray] = []
+        self._recording = False
+        self._thread: Optional[threading.Thread] = None
+        self._device_name: str = ""
+        self._error: Optional[BaseException] = None
+        self._started_at: Optional[float] = None
+        self._ready = threading.Event()
+        self._start_error: Optional[BaseException] = None
+
+    def _resolve(self, pa: Any) -> PlaybackDevice:
+        if self._device_resolver is not None:
+            return self._device_resolver(pa)
+        return get_default_playback_device(pa)
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    @property
+    def device_name(self) -> str:
+        with self._lock:
+            return self._device_name
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        return self._error
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._started_at)
+
+    def start(self) -> str:
+        """Start loopback recording. Returns the current device name."""
+        if self._recording or self._thread is not None:
+            raise RuntimeError("已在錄音中。")
+
+        with self._lock:
+            self._chunks = []
+            self._device_name = ""
+            self._error = None
+            self._start_error = None
+            self._started_at = time.monotonic()
+            self._recording = True
+
+        self._ready.clear()
+        self._thread = threading.Thread(
+            target=self._capture_loop,
+            name="loopback-capture",
+            daemon=True,
+        )
+        self._thread.start()
+
+        if not self._ready.wait(timeout=8.0):
+            self._recording = False
+            self._thread.join(timeout=2.0)
+            self._thread = None
+            raise RuntimeError("無法在時限內啟動錄音。")
+
+        if self._start_error is not None:
+            err = self._start_error
+            self._start_error = None
+            self._thread.join(timeout=2.0)
+            self._thread = None
+            self._recording = False
+            raise RuntimeError(f"無法開始錄音：{err}") from err
+
+        return self.device_name
+
+    def stop(self) -> np.ndarray:
+        """Stop recording and return concatenated float32 PCM frames."""
+        if not self._recording and self._thread is None:
+            return np.zeros((0, self.channels), dtype=np.float32)
+
+        self._recording = False
+        if self._thread is not None:
+            self._thread.join(timeout=10.0)
+            self._thread = None
+
+        if self._error is not None:
+            err = self._error
+            self._error = None
+            raise RuntimeError(f"錄音失敗：{err}") from err
+
+        with self._lock:
+            chunks = list(self._chunks)
+            self._chunks = []
+            self._started_at = None
+
+        if not chunks:
+            return np.zeros((0, self.channels), dtype=np.float32)
+        return np.concatenate(chunks, axis=0)
+
+    def _open_stream(self, pa: Any, pyaudio_mod: Any, device: PlaybackDevice):
+        channels = min(self.channels, device.channels) or 1
+        rate = device.samplerate or self.samplerate
+        stream = pa.open(
+            format=pyaudio_mod.paFloat32,
+            channels=channels,
+            rate=rate,
+            input=True,
+            input_device_index=device.loopback_index,
+            frames_per_buffer=FRAMES_PER_BUFFER,
+        )
+        with self._lock:
+            self._device_name = device.name
+            self.channels = channels
+            self.samplerate = rate
+        return stream
+
+    def _close_stream(self, stream: Any) -> None:
+        if stream is None:
+            return
+        try:
+            if stream.is_active():
+                stream.stop_stream()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    def _capture_loop(self) -> None:
+        mod = self._pyaudio_module
+        if mod is None:
+            import pyaudiowpatch as mod  # type: ignore
+
+        pa = None
+        stream = None
+        current_key: Optional[int] = None
+        next_device_check = 0.0
+        ready_set = False
+
+        try:
+            pa = mod.PyAudio()
+            while self._recording:
+                now = time.monotonic()
+                if stream is None or now >= next_device_check:
+                    next_device_check = now + self.poll_interval
+                    device = self._resolve(pa)
+                    if device.loopback_index != current_key:
+                        self._close_stream(stream)
+                        stream = None
+                        time.sleep(0.05)
+                        stream = self._open_stream(pa, mod, device)
+                        current_key = device.loopback_index
+
+                    if not ready_set:
+                        ready_set = True
+                        self._ready.set()
+
+                assert stream is not None
+                raw = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
+                arr = np.frombuffer(raw, dtype=np.float32)
+                if arr.size == 0:
+                    continue
+                channels = self.channels
+                frames = arr.size // channels
+                if frames <= 0:
+                    continue
+                arr = arr[: frames * channels].reshape(frames, channels).copy()
+                sink = self.chunk_sink
+                with self._lock:
+                    if self.keep_chunks:
+                        self._chunks.append(arr)
+                if sink is not None:
+                    try:
+                        sink(arr)
+                    except Exception as exc:  # noqa: BLE001
+                        self._error = exc
+                        self._recording = False
+                        break
+        except BaseException as exc:  # noqa: BLE001
+            if not ready_set:
+                self._start_error = exc
+                self._ready.set()
+            else:
+                self._error = exc
+            self._recording = False
+        finally:
+            self._close_stream(stream)
+            if pa is not None:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
+            if not ready_set:
+                self._ready.set()
+
+========================================================================
+第八章  music_recorder/encoder.py  （MP3／WAV 編碼）
+檔案：music_recorder/encoder.py
+========================================================================
+
+"""Encode float32 PCM audio to MP3 using lameenc, and stream WAV."""
+
+from __future__ import annotations
+
+import wave
+from pathlib import Path
+from typing import Optional, Union
+
+import lameenc
+import numpy as np
+
+
+def pcm_to_mp3(
+    pcm: np.ndarray,
+    samplerate: int,
+    *,
+    bitrate: int = 192,
+) -> bytes:
+    """Convert float32 PCM in range [-1, 1] to MP3 bytes.
+
+    Args:
+        pcm: Array shaped (frames,) or (frames, channels).
+        samplerate: Sample rate in Hz.
+        bitrate: Target MP3 bitrate in kbps.
+    """
+    if pcm.size == 0:
+        raise ValueError("沒有可編碼的音訊資料。")
+
+    arr = np.asarray(pcm, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"不支援的 PCM 形狀：{arr.shape}")
+
+    channels = int(arr.shape[1])
+    if channels not in (1, 2):
+        # Downmix / trim to stereo for lameenc
+        if channels > 2:
+            arr = arr[:, :2]
+            channels = 2
+        else:
+            raise ValueError(f"不支援的聲道數：{channels}")
+
+    clipped = np.clip(arr, -1.0, 1.0)
+    pcm_i16 = (clipped * 32767.0).astype(np.int16)
+    interleaved = np.ascontiguousarray(pcm_i16).reshape(-1)
+
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(bitrate)
+    encoder.set_in_sample_rate(samplerate)
+    encoder.set_channels(channels)
+    encoder.set_quality(2)
+
+    mp3_data = encoder.encode(interleaved.tobytes())
+    mp3_data += encoder.flush()
+    if not mp3_data:
+        raise RuntimeError("MP3 編碼結果為空。")
+    return bytes(mp3_data)
+
+
+def save_mp3(
+    path: Union[str, Path],
+    pcm: np.ndarray,
+    samplerate: int,
+    *,
+    bitrate: int = 192,
+) -> Path:
+    """Encode PCM to MP3 and write to ``path``. Returns the written path."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    data = pcm_to_mp3(pcm, samplerate, bitrate=bitrate)
+    out.write_bytes(data)
+    return out
+
+
+def _pcm_to_int16(pcm: np.ndarray) -> np.ndarray:
+    arr = np.asarray(pcm, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"不支援的 PCM 形狀：{arr.shape}")
+    clipped = np.clip(arr, -1.0, 1.0)
+    return np.ascontiguousarray((clipped * 32767.0).astype(np.int16))
+
+
+class StreamingWavWriter:
+    """Incrementally write float32 PCM to a 16-bit WAV file."""
+
+    def __init__(self, path: Union[str, Path], samplerate: int, channels: int) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.samplerate = int(samplerate)
+        self.channels = max(1, int(channels))
+        self._frames = 0
+        self._closed = False
+        self._wav = wave.open(str(self.path), "wb")
+        self._wav.setnchannels(self.channels)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(self.samplerate)
+
+    @property
+    def frame_count(self) -> int:
+        return self._frames
+
+    def write(self, pcm: np.ndarray) -> None:
+        if self._closed or pcm is None or pcm.size == 0:
+            return
+        pcm_i16 = _pcm_to_int16(pcm)
+        if pcm_i16.shape[1] != self.channels:
+            if pcm_i16.shape[1] > self.channels:
+                pcm_i16 = pcm_i16[:, : self.channels]
+            else:
+                pad = np.zeros(
+                    (pcm_i16.shape[0], self.channels - pcm_i16.shape[1]),
+                    dtype=np.int16,
+                )
+                pcm_i16 = np.concatenate([pcm_i16, pad], axis=1)
+        self._wav.writeframes(np.ascontiguousarray(pcm_i16).reshape(-1).tobytes())
+        self._frames += int(pcm_i16.shape[0])
+
+    def close(self) -> Optional[Path]:
+        if self._closed:
+            return self.path if self._frames else None
+        self._closed = True
+        try:
+            self._wav.close()
+        except Exception:
+            pass
+        if self._frames <= 0:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        return self.path
+
+========================================================================
+第九章  music_recorder/ffmpeg_bin.py  （FFmpeg 指令）
+檔案：music_recorder/ffmpeg_bin.py
+========================================================================
+
+"""Locate ffmpeg and build capture / mux command lines."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
+
+GRAB_FPS = 30
+SCALE_EVEN = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+
+def popen_kwargs() -> dict:
+    """Flags so ffmpeg does not flash a console window on Windows."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def get_ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise RuntimeError("未安裝 imageio-ffmpeg，無法進行螢幕錄影。") from exc
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _run_ffmpeg_help(ffmpeg: str, args: Sequence[str]) -> str:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        **popen_kwargs(),
+    )
+    return (result.stdout or "") + (result.stderr or "")
+
+
+@lru_cache(maxsize=4)
+def list_encoders(ffmpeg: Optional[str] = None) -> frozenset[str]:
+    exe = ffmpeg or get_ffmpeg_exe()
+    text = _run_ffmpeg_help(exe, ["-encoders"])
+    names: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        parts = stripped.split()
+        if len(parts) >= 2 and len(parts[0]) >= 6 and parts[0][0] in "VAS":
+            names.add(parts[1])
+    return frozenset(names)
+
+
+@lru_cache(maxsize=4)
+def has_gdigrab(ffmpeg: Optional[str] = None) -> bool:
+    exe = ffmpeg or get_ffmpeg_exe()
+    text = _run_ffmpeg_help(exe, ["-formats"])
+    return "gdigrab" in text
+
+
+def video_encoder_args(encoders: Optional[Iterable[str]] = None) -> List[str]:
+    available = set(encoders) if encoders is not None else set(list_encoders())
+    if "h264_mf" in available:
+        return [
+            "-c:v",
+            "h264_mf",
+            "-scenario",
+            "archive",
+            "-rate_control",
+            "quality",
+            "-quality",
+            "70",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    if "libx264" in available:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    raise RuntimeError("找不到可用的 H.264 編碼器（h264_mf / libx264）。")
+
+
+def build_gdigrab_cmd(
+    ffmpeg: str,
+    output: Path,
+    encoder_args: Sequence[str],
+    *,
+    fps: int = GRAB_FPS,
+) -> List[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-f",
+        "gdigrab",
+        "-framerate",
+        str(fps),
+        "-draw_mouse",
+        "1",
+        "-i",
+        "desktop",
+        "-vf",
+        SCALE_EVEN,
+        *encoder_args,
+        str(output),
+    ]
+
+
+def build_rawvideo_cmd(
+    ffmpeg: str,
+    output: Path,
+    encoder_args: Sequence[str],
+    *,
+    width: int,
+    height: int,
+    fps: int = GRAB_FPS,
+    pix_fmt: str = "bgra",
+) -> List[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        pix_fmt,
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-vf",
+        SCALE_EVEN,
+        *encoder_args,
+        str(output),
+    ]
+
+
+def build_mux_cmd(
+    ffmpeg: str,
+    video: Path,
+    output: Path,
+    audio: Optional[Path] = None,
+) -> List[str]:
+    cmd = [ffmpeg, "-y", "-i", str(video)]
+    if audio is not None:
+        cmd += [
+            "-i",
+            str(audio),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+        ]
+    else:
+        cmd += ["-c:v", "copy", "-an"]
+    cmd += ["-movflags", "+faststart", str(output)]
+    return cmd
+
+========================================================================
+第十章  music_recorder/screen.py  （螢幕錄影）
+檔案：music_recorder/screen.py
+========================================================================
+
+"""Screen recording: virtual desktop video + loopback audio, hourly MP4 files."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, List, Optional, Protocol
+
+from music_recorder.capture import LoopbackRecorder
+from music_recorder.encoder import StreamingWavWriter
+from music_recorder.ffmpeg_bin import (
+    GRAB_FPS,
+    build_gdigrab_cmd,
+    build_mux_cmd,
+    build_rawvideo_cmd,
+    get_ffmpeg_exe,
+    has_gdigrab,
+    list_encoders,
+    popen_kwargs,
+    video_encoder_args,
+)
+
+SEGMENT_SECONDS = 3600.0
+
+
+def default_screen_filename(now: Optional[datetime] = None) -> str:
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"screen_{stamp}.mp4"
+
+
+def unique_output_path(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    n = 2
+    while True:
+        candidate = directory / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+class GrabSession(Protocol):
+    def request_stop(self) -> None: ...
+
+    def wait(self, timeout: float) -> None: ...
+
+
+class SubprocessGrab:
+    """FFmpeg child process writing a video file."""
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        *,
+        stop_mode: str,
+        writer_stop: Optional[threading.Event] = None,
+        writer_thread: Optional[threading.Thread] = None,
+    ) -> None:
+        self.proc = proc
+        self.stop_mode = stop_mode
+        self._writer_stop = writer_stop
+        self._writer_thread = writer_thread
+        self._stderr: List[bytes] = []
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name="ffmpeg-stderr",
+            daemon=True,
+        )
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        stream = self.proc.stderr
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                self._stderr.append(chunk)
+                if len(self._stderr) > 24:
+                    self._stderr.pop(0)
+        except Exception:
+            pass
+
+    def stderr_tail(self) -> str:
+        try:
+            return b"".join(self._stderr).decode("utf-8", errors="replace")[-800:]
+        except Exception:
+            return ""
+
+    def request_stop(self) -> None:
+        if self._writer_stop is not None:
+            self._writer_stop.set()
+        try:
+            if self.proc.stdin is None:
+                return
+            if self.stop_mode == "q":
+                self.proc.stdin.write(b"q\n")
+                self.proc.stdin.flush()
+            else:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+
+    def wait(self, timeout: float) -> None:
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=3)
+        self._stderr_thread.join(timeout=1)
+
+
+class FFmpegBackend:
+    """Start desktop capture and mux A/V with a real ffmpeg binary."""
+
+    def __init__(self, ffmpeg: Optional[str] = None) -> None:
+        self.ffmpeg = ffmpeg or get_ffmpeg_exe()
+        self.encoder_args = video_encoder_args(list_encoders(self.ffmpeg))
+        self.use_gdigrab = has_gdigrab(self.ffmpeg)
+
+    def start_grab(self, dest: Path) -> GrabSession:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if self.use_gdigrab:
+            return self._start_gdigrab(dest)
+        return self._start_mss(dest)
+
+    def mux(self, video: Path, audio: Optional[Path], dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        audio_path = audio if audio is not None and audio.exists() else None
+        cmd = build_mux_cmd(self.ffmpeg, video, dest, audio_path)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            **popen_kwargs(),
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()[-800:]
+            raise RuntimeError(f"合成 MP4 失敗：{err or result.returncode}")
+        if not dest.exists() or dest.stat().st_size == 0:
+            raise RuntimeError("合成 MP4 結果為空。")
+
+    def _popen(self, cmd: List[str]) -> subprocess.Popen:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            **popen_kwargs(),
+        )
+
+    def _start_gdigrab(self, dest: Path) -> SubprocessGrab:
+        cmd = build_gdigrab_cmd(self.ffmpeg, dest, self.encoder_args, fps=GRAB_FPS)
+        proc = self._popen(cmd)
+        session = SubprocessGrab(proc, stop_mode="q")
+        time.sleep(0.6)
+        if proc.poll() is not None:
+            raise RuntimeError(f"無法開始螢幕擷取：{session.stderr_tail() or 'ffmpeg 立即結束'}")
+        return session
+
+    def _start_mss(self, dest: Path) -> SubprocessGrab:
+        try:
+            import mss
+        except ImportError as exc:
+            raise RuntimeError("此 ffmpeg 不支援 gdigrab，且未安裝 mss，無法擷取螢幕。") from exc
+
+        with mss.mss() as probe:
+            mon = probe.monitors[0]
+            width = int(mon["width"])
+            height = int(mon["height"])
+        if width <= 0 or height <= 0:
+            raise RuntimeError("找不到可用的顯示器。")
+
+        cmd = build_rawvideo_cmd(
+            self.ffmpeg,
+            dest,
+            self.encoder_args,
+            width=width,
+            height=height,
+            fps=GRAB_FPS,
+            pix_fmt="bgra",
+        )
+        proc = self._popen(cmd)
+        writer_stop = threading.Event()
+
+        def writer() -> None:
+            interval = 1.0 / GRAB_FPS
+            try:
+                with mss.mss() as sct:
+                    monitor = sct.monitors[0]
+                    next_t = time.monotonic()
+                    while not writer_stop.is_set() and proc.poll() is None:
+                        frame = sct.grab(monitor)
+                        try:
+                            if proc.stdin is None:
+                                break
+                            proc.stdin.write(frame.bgra)
+                        except (BrokenPipeError, OSError):
+                            break
+                        next_t += interval
+                        delay = next_t - time.monotonic()
+                        if delay > 0:
+                            writer_stop.wait(timeout=delay)
+            except Exception:
+                writer_stop.set()
+
+        thread = threading.Thread(target=writer, name="mss-grab", daemon=True)
+        thread.start()
+        session = SubprocessGrab(
+            proc,
+            stop_mode="pipe",
+            writer_stop=writer_stop,
+            writer_thread=thread,
+        )
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            raise RuntimeError(f"無法開始螢幕擷取：{session.stderr_tail() or 'ffmpeg 立即結束'}")
+        return session
+
+
+class ScreenRecorder:
+    """Record all displays plus system audio, saving one MP4 per hour."""
+
+    def __init__(
+        self,
+        recorder: LoopbackRecorder,
+        output_dir: Path,
+        *,
+        segment_seconds: float = SEGMENT_SECONDS,
+        backend: Optional[FFmpegBackend] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+        temp_dir: Optional[Path] = None,
+        on_segment_done: Optional[
+            Callable[[Optional[Path], Optional[BaseException]], None]
+        ] = None,
+    ) -> None:
+        self._recorder = recorder
+        self._output_dir = Path(output_dir)
+        self._segment_seconds = float(segment_seconds)
+        self._backend = backend
+        self._clock = clock or datetime.now
+        self._temp_dir_arg = Path(temp_dir) if temp_dir is not None else None
+        self.on_segment_done = on_segment_done
+
+        self._recording = False
+        self._stop_event = threading.Event()
+        self._io_lock = threading.Lock()
+        self._rotate_lock = threading.Lock()
+        self._segment_index = 0
+        self._grab: Optional[GrabSession] = None
+        self._wav: Optional[StreamingWavWriter] = None
+        self._video_path: Optional[Path] = None
+        self._segment_started_at: Optional[datetime] = None
+        self._mux_threads: List[threading.Thread] = []
+        self._saved: List[Path] = []
+        self._error: Optional[BaseException] = None
+        self._started_at: Optional[float] = None
+        self._rotate_thread: Optional[threading.Thread] = None
+        self._temp_dir: Optional[Path] = None
+        self._own_temp = False
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._started_at)
+
+    @property
+    def saved_paths(self) -> List[Path]:
+        with self._io_lock:
+            return list(self._saved)
+
+    def start(self) -> str:
+        if self._recording:
+            raise RuntimeError("已在螢幕錄影中。")
+        if self._recorder.is_recording:
+            raise RuntimeError("請先停止目前的錄音。")
+
+        if self._backend is None:
+            self._backend = FFmpegBackend()
+
+        self._stop_event.clear()
+        self._error = None
+        self._saved = []
+        self._segment_index = 0
+        self._mux_threads = []
+        self._grab = None
+        self._wav = None
+        self._video_path = None
+
+        if self._temp_dir_arg is not None:
+            self._temp_dir = self._temp_dir_arg
+            self._temp_dir.mkdir(parents=True, exist_ok=True)
+            self._own_temp = False
+        else:
+            self._temp_dir = Path(tempfile.mkdtemp(prefix="musicrecord_screen_"))
+            self._own_temp = True
+
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._recorder.keep_chunks = False
+        self._recorder.chunk_sink = self._on_audio_chunk
+
+        try:
+            device_name = self._recorder.start()
+            self._recording = True
+            self._started_at = time.monotonic()
+            self._begin_segment()
+        except Exception:
+            self._recording = False
+            self._cleanup_failed_start()
+            raise
+
+        self._rotate_thread = threading.Thread(
+            target=self._rotate_loop,
+            name="screen-rotate",
+            daemon=True,
+        )
+        self._rotate_thread.start()
+        return device_name
+
+    def stop(self) -> List[Path]:
+        if not self._recording and self._grab is None:
+            return self.saved_paths
+
+        self._recording = False
+        self._stop_event.set()
+        if self._rotate_thread is not None:
+            self._rotate_thread.join(timeout=8.0)
+            self._rotate_thread = None
+
+        with self._rotate_lock:
+            video, audio, dest = self._finalize_current()
+
+        try:
+            self._recorder.stop()
+        except Exception:
+            pass
+        self._recorder.chunk_sink = None
+        self._recorder.keep_chunks = True
+
+        if video is not None:
+            self._mux_and_notify(video, audio, dest)
+
+        for thread in list(self._mux_threads):
+            thread.join(timeout=180)
+
+        saved = self.saved_paths
+        self._cleanup_temp()
+        self._started_at = None
+        if self._error is not None and not saved:
+            err = self._error
+            self._error = None
+            raise RuntimeError(f"螢幕錄影失敗：{err}") from err
+        return saved
+
+    def _on_audio_chunk(self, arr) -> None:
+        with self._io_lock:
+            if self._wav is not None:
+                self._wav.write(arr)
+
+    def _begin_segment(self) -> None:
+        assert self._temp_dir is not None
+        assert self._backend is not None
+        self._segment_index += 1
+        video_path = self._temp_dir / f"video_{self._segment_index:03d}.mp4"
+        wav_path = self._temp_dir / f"audio_{self._segment_index:03d}.wav"
+        with self._io_lock:
+            self._wav = StreamingWavWriter(
+                wav_path,
+                samplerate=self._recorder.samplerate,
+                channels=self._recorder.channels,
+            )
+            self._video_path = video_path
+            self._segment_started_at = self._clock()
+        try:
+            self._grab = self._backend.start_grab(video_path)
+        except Exception:
+            with self._io_lock:
+                if self._wav is not None:
+                    self._wav.close()
+                    self._wav = None
+                self._video_path = None
+            raise
+
+    def _finalize_current(
+        self,
+    ) -> tuple[Optional[Path], Optional[Path], Path]:
+        grab = self._grab
+        self._grab = None
+        if grab is not None:
+            try:
+                grab.request_stop()
+                grab.wait(timeout=25)
+            except Exception:
+                pass
+
+        with self._io_lock:
+            wav_path = self._wav.close() if self._wav is not None else None
+            self._wav = None
+            video_path = self._video_path
+            self._video_path = None
+            started = self._segment_started_at or self._clock()
+
+        dest = unique_output_path(self._output_dir, default_screen_filename(started))
+        return video_path, wav_path, dest
+
+    def _spawn_mux(
+        self,
+        video: Optional[Path],
+        audio: Optional[Path],
+        dest: Path,
+    ) -> None:
+        thread = threading.Thread(
+            target=self._mux_and_notify,
+            args=(video, audio, dest),
+            name="screen-mux",
+            daemon=True,
+        )
+        self._mux_threads.append(thread)
+        thread.start()
+
+    def _mux_and_notify(
+        self,
+        video: Optional[Path],
+        audio: Optional[Path],
+        dest: Path,
+    ) -> None:
+        err: Optional[BaseException] = None
+        saved: Optional[Path] = None
+        try:
+            if video is None or not video.exists() or video.stat().st_size == 0:
+                raise RuntimeError("沒有錄到畫面。")
+            assert self._backend is not None
+            self._backend.mux(video, audio, dest)
+            saved = dest
+            with self._io_lock:
+                self._saved.append(dest)
+        except BaseException as exc:  # noqa: BLE001
+            err = exc
+            with self._io_lock:
+                self._error = exc
+        finally:
+            for path in (video, audio):
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            callback = self.on_segment_done
+            if callback is not None:
+                try:
+                    callback(saved, err)
+                except Exception:
+                    pass
+
+    def _rotate_loop(self) -> None:
+        while not self._stop_event.is_set() and self._recording:
+            if self._started_at is None:
+                break
+            deadline = self._started_at + self._segment_seconds * self._segment_index
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._stop_event.wait(timeout=min(remaining, 0.25))
+                continue
+            if self._stop_event.is_set() or not self._recording:
+                break
+            try:
+                self._rotate_segment()
+            except BaseException as exc:  # noqa: BLE001
+                self._error = exc
+                self._recording = False
+                callback = self.on_segment_done
+                if callback is not None:
+                    try:
+                        callback(None, exc)
+                    except Exception:
+                        pass
+                break
+
+    def _rotate_segment(self) -> None:
+        with self._rotate_lock:
+            if not self._recording or self._stop_event.is_set():
+                return
+            video, audio, dest = self._finalize_current()
+            if self._recording and not self._stop_event.is_set():
+                self._begin_segment()
+        self._spawn_mux(video, audio, dest)
+
+    def _cleanup_failed_start(self) -> None:
+        self._recorder.chunk_sink = None
+        self._recorder.keep_chunks = True
+        if self._recorder.is_recording:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+        try:
+            self._finalize_current()
+        except Exception:
+            pass
+        self._cleanup_temp()
+        self._started_at = None
+
+    def _cleanup_temp(self) -> None:
+        if self._own_temp and self._temp_dir is not None:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+        if self._own_temp:
+            self._temp_dir = None
+
+========================================================================
+第十一章  tests/test_app_logic.py  （介面與存檔流程測試）
+檔案：tests/test_app_logic.py
+========================================================================
+
+"""Tests for UI helper logic and stop/save flow (no real audio devices)."""
+
+import time
+from pathlib import Path
+
+import pytest
+
+from music_recorder.app import (
+    RecorderApp,
+    default_downloads_dir,
+    default_filename,
+    default_output_dir,
+    format_elapsed,
+)
+from music_recorder.capture import LoopbackRecorder
+from music_recorder.devices import PlaybackDevice
+from tests.test_capture import DeviceSwitcher, FakePyAudio
+
+
+def test_format_elapsed():
+    assert format_elapsed(0) == "00:00"
+    assert format_elapsed(65) == "01:05"
+    assert format_elapsed(3661) == "01:01:01"
+
+
+def test_default_filename_pattern():
+    name = default_filename()
+    assert name.startswith("recording_")
+    assert name.endswith(".mp3")
+
+
+def test_default_output_dir_is_desktop():
+    path = default_output_dir()
+    assert path.name == "Desktop"
+    assert path.is_absolute()
+    assert default_downloads_dir() == path
+
+
+@pytest.fixture
+def fake_stack():
+    mod = FakePyAudio()
+    switcher = DeviceSwitcher()
+    recorder = LoopbackRecorder(
+        samplerate=48000,
+        channels=2,
+        poll_interval=1.0,
+        pyaudio_module=mod,
+        device_resolver=switcher.resolve,
+    )
+    return mod, switcher, recorder
+
+
+def test_app_timer_increases_while_recording(fake_stack, monkeypatch):
+    _mod, _switcher, recorder = fake_stack
+
+    monkeypatch.setattr(
+        "music_recorder.app.get_default_playback_device",
+        lambda: PlaybackDevice("Test Speakers", 1, 11, 48000, 2),
+    )
+
+    saved: list[str] = []
+
+    def ask_save(name: str, directory: Path):
+        path = directory / name
+        saved.append(str(path))
+        return str(path)
+
+    app = RecorderApp(
+        recorder=recorder,
+        ask_save_path=ask_save,
+        downloads_dir=Path.cwd() / "_test_downloads",
+    )
+    app.update()
+    app.start_recording()
+    app.update()
+    time.sleep(0.35)
+    app.update()
+    app._tick()
+    assert ":" in app.timer_label.cget("text")
+
+    app.stop_recording()
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        app.update()
+        if saved and not app._busy:
+            break
+        time.sleep(0.05)
+
+    assert saved, "expected save dialog to be used"
+    assert Path(saved[0]).exists()
+    assert app.screen_record_btn.cget("state") == "normal"
+    app.destroy()
+
+
+class FakeScreen:
+    def __init__(self) -> None:
+        self.is_recording = False
+        self.elapsed_seconds = 1.25
+        self.on_segment_done = None
+
+    def start(self) -> str:
+        self.is_recording = True
+        return "Test Speakers"
+
+    def stop(self):
+        self.is_recording = False
+        return [Path("screen_20260911_120000.mp4")]
+
+
+def test_app_screen_buttons_mutex(fake_stack, monkeypatch, tmp_path: Path):
+    _mod, _switcher, recorder = fake_stack
+    monkeypatch.setattr(
+        "music_recorder.app.get_default_playback_device",
+        lambda: PlaybackDevice("Test Speakers", 1, 11, 48000, 2),
+    )
+    screen = FakeScreen()
+    app = RecorderApp(
+        recorder=recorder,
+        output_dir=tmp_path,
+        screen_recorder=screen,
+    )
+    app.update()
+    app.start_screen_recording()
+    app.update()
+    assert screen.is_recording is True
+    assert str(app.record_btn.cget("state")) == "disabled"
+    assert str(app.stop_btn.cget("state")) == "disabled"
+    assert str(app.screen_record_btn.cget("state")) == "disabled"
+    assert str(app.screen_stop_btn.cget("state")) == "normal"
+
+    app.stop_screen_recording()
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        app.update()
+        if not app._busy:
+            break
+        time.sleep(0.05)
+
+    assert screen.is_recording is False
+    assert str(app.record_btn.cget("state")) == "normal"
+    assert str(app.screen_record_btn.cget("state")) == "normal"
+    app.destroy()
+
+========================================================================
+第十二章  tests/test_devices.py  （播放裝置測試）
+檔案：tests/test_devices.py
+========================================================================
+
+"""Tests for default playback device resolution."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from music_recorder import devices as devices_mod
+from music_recorder.devices import get_default_playback_device
+
+
+class FakePa:
+    paWASAPI = 1
+
+    def __init__(self, output_name: str, loopbacks: list[dict]) -> None:
+        self._output_name = output_name
+        self._loopbacks = loopbacks
+        self.terminated = False
+
+    def get_host_api_info_by_type(self, api_type):
+        assert api_type == FakePa.paWASAPI
+        return {"defaultOutputDevice": 5}
+
+    def get_device_info_by_index(self, index):
+        assert index == 5
+        return {"name": self._output_name, "index": 5}
+
+    def get_loopback_device_info_generator(self):
+        yield from self._loopbacks
+
+    def terminate(self):
+        self.terminated = True
+
+
+def test_get_default_playback_device_matches_loopback(monkeypatch):
+    fake = FakePa(
+        "Headphones (BT)",
+        [
+            {
+                "index": 9,
+                "name": "Speakers [Loopback]",
+                "maxInputChannels": 2,
+                "defaultSampleRate": 48000,
+            },
+            {
+                "index": 10,
+                "name": "Headphones (BT) [Loopback]",
+                "maxInputChannels": 2,
+                "defaultSampleRate": 48000,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        devices_mod,
+        "get_default_playback_device",
+        lambda pa=None: devices_mod._resolve_default(fake, FakePa),
+    )
+    # Call helper directly to avoid importing real pyaudiowpatch in resolve path
+    device = devices_mod._resolve_default(fake, FakePa)
+    assert device.name == "Headphones (BT)"
+    assert device.loopback_index == 10
+    assert device.channels == 2
+
+
+def test_get_default_playback_device_raises_without_loopback():
+    fake = FakePa(
+        "Mystery Output",
+        [
+            {
+                "index": 9,
+                "name": "Other [Loopback]",
+                "maxInputChannels": 2,
+                "defaultSampleRate": 48000,
+            }
+        ],
+    )
+    with pytest.raises(RuntimeError, match="迴路擷取"):
+        devices_mod._resolve_default(fake, FakePa)
+
+
+def test_get_default_playback_device_raises_without_speaker():
+    fake = SimpleNamespace(
+        get_host_api_info_by_type=lambda *_: {"defaultOutputDevice": -1},
+    )
+    with pytest.raises(RuntimeError, match="預設播放裝置"):
+        devices_mod._resolve_default(fake, FakePa)
+
+========================================================================
+第十三章  tests/test_capture.py  （音訊擷取測試）
+檔案：tests/test_capture.py
+========================================================================
+
+"""Tests for loopback capture and device following."""
+
+import time
+from types import SimpleNamespace
+
+import numpy as np
+
+from music_recorder.capture import LoopbackRecorder
+from music_recorder.devices import PlaybackDevice
+
+
+class FakeStream:
+    def __init__(self) -> None:
+        self.closed = False
+        self._n = 0
+
+    def is_active(self):
+        return not self.closed
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def read(self, frames, exception_on_overflow=False):
+        self._n += 1
+        # stereo float32 silence-ish tone
+        data = np.full((frames, 2), 0.1, dtype=np.float32)
+        return data.tobytes()
+
+
+class FakePyAudio:
+    paFloat32 = 1
+    paWASAPI = 1
+
+    def __init__(self) -> None:
+        self.streams: list[FakeStream] = []
+        self.terminated = False
+
+    def PyAudio(self):
+        return self
+
+    def open(self, **kwargs):
+        stream = FakeStream()
+        self.streams.append(stream)
+        return stream
+
+    def terminate(self):
+        self.terminated = True
+
+
+class DeviceSwitcher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def resolve(self, pa) -> PlaybackDevice:
+        self.calls += 1
+        if self.calls <= 2:
+            return PlaybackDevice("Speakers", 1, 11, 48000, 2)
+        return PlaybackDevice("Bluetooth Headset", 2, 22, 48000, 2)
+
+
+def test_recorder_start_stop_returns_pcm():
+    mod = FakePyAudio()
+    switcher = DeviceSwitcher()
+    rec = LoopbackRecorder(
+        samplerate=48000,
+        channels=2,
+        poll_interval=0.05,
+        pyaudio_module=mod,
+        device_resolver=switcher.resolve,
+    )
+    name = rec.start()
+    assert name == "Speakers"
+    time.sleep(0.3)
+    pcm = rec.stop()
+    assert pcm.ndim == 2
+    assert pcm.shape[1] == 2
+    assert pcm.shape[0] > 0
+    assert rec.is_recording is False
+    assert mod.terminated is True
+
+
+def test_recorder_follows_device_change():
+    mod = FakePyAudio()
+    switcher = DeviceSwitcher()
+    rec = LoopbackRecorder(
+        samplerate=48000,
+        channels=2,
+        poll_interval=0.05,
+        pyaudio_module=mod,
+        device_resolver=switcher.resolve,
+    )
+    rec.start()
+    deadline = time.time() + 2.0
+    seen_bt = False
+    while time.time() < deadline:
+        if rec.device_name == "Bluetooth Headset":
+            seen_bt = True
+            break
+        time.sleep(0.05)
+    pcm = rec.stop()
+    assert seen_bt
+    assert len(mod.streams) >= 2
+    assert mod.streams[0].closed is True
+    assert pcm.shape[0] > 0
+
+
+def test_recorder_chunk_sink_without_keeping_chunks():
+    received: list = []
+
+    def sink(arr) -> None:
+        received.append(arr)
+
+    rec = LoopbackRecorder(
+        samplerate=48000,
+        channels=2,
+        poll_interval=1.0,
+        pyaudio_module=FakePyAudio(),
+        device_resolver=DeviceSwitcher().resolve,
+        keep_chunks=False,
+        chunk_sink=sink,
+    )
+    rec.start()
+    time.sleep(0.2)
+    pcm = rec.stop()
+    assert pcm.size == 0
+    assert len(received) > 0
+    assert rec.is_recording is False
+
+========================================================================
+第十四章  tests/test_encoder.py  （編碼測試）
+檔案：tests/test_encoder.py
+========================================================================
+
+"""Tests for PCM to MP3 encoding and streaming WAV."""
+
+from pathlib import Path
+import wave
+
+import numpy as np
+import pytest
+
+from music_recorder.encoder import StreamingWavWriter, pcm_to_mp3, save_mp3
+
+
+def _sine(seconds: float = 0.25, sr: int = 44100, freq: float = 440.0) -> np.ndarray:
+    t = np.linspace(0, seconds, int(sr * seconds), endpoint=False)
+    mono = 0.2 * np.sin(2 * np.pi * freq * t)
+    return np.stack([mono, mono], axis=1).astype(np.float32)
+
+
+def test_pcm_to_mp3_produces_mpeg_frame():
+    pcm = _sine()
+    data = pcm_to_mp3(pcm, 44100, bitrate=128)
+    assert isinstance(data, bytes)
+    assert len(data) > 100
+    # MP3 frames typically start with 0xFFEx sync word
+    assert data[0] == 0xFF
+    assert (data[1] & 0xE0) == 0xE0
+
+
+def test_pcm_to_mp3_rejects_empty():
+    with pytest.raises(ValueError, match="沒有可編碼"):
+        pcm_to_mp3(np.zeros((0, 2), dtype=np.float32), 48000)
+
+
+def test_save_mp3_writes_file(tmp_path: Path):
+    out = tmp_path / "clip.mp3"
+    path = save_mp3(out, _sine(), 44100)
+    assert path.exists()
+    assert path.stat().st_size > 100
+    assert path.read_bytes()[:1] == b"\xff"
+
+
+def test_streaming_wav_writer_roundtrip(tmp_path: Path):
+    out = tmp_path / "clip.wav"
+    writer = StreamingWavWriter(out, samplerate=48000, channels=2)
+    writer.write(_sine(0.1, sr=48000))
+    writer.write(_sine(0.1, sr=48000))
+    path = writer.close()
+    assert path is not None
+    assert path.exists()
+    with wave.open(str(path), "rb") as wf:
+        assert wf.getnchannels() == 2
+        assert wf.getframerate() == 48000
+        assert wf.getnframes() > 0
+
+
+def test_streaming_wav_writer_empty_deletes_file(tmp_path: Path):
+    out = tmp_path / "empty.wav"
+    writer = StreamingWavWriter(out, samplerate=48000, channels=2)
+    path = writer.close()
+    assert path is None
+    assert not out.exists()
+
+========================================================================
+第十五章  tests/test_ffmpeg_bin.py  （FFmpeg 指令測試）
+檔案：tests/test_ffmpeg_bin.py
+========================================================================
+
+"""Tests for ffmpeg command helpers (no real encoding)."""
+
+from pathlib import Path
+
+import pytest
+
+from music_recorder.ffmpeg_bin import (
+    build_gdigrab_cmd,
+    build_mux_cmd,
+    video_encoder_args,
+)
+
+
+def test_video_encoder_prefers_h264_mf():
+    args = video_encoder_args(["libx264", "h264_mf", "aac"])
+    assert args[:2] == ["-c:v", "h264_mf"]
+    assert "yuv420p" in args
+    assert "quality" in args
+
+
+def test_video_encoder_falls_back_to_libx264():
+    args = video_encoder_args(["libx264", "aac"])
+    assert args[:2] == ["-c:v", "libx264"]
+
+
+def test_video_encoder_raises_without_h264():
+    with pytest.raises(RuntimeError, match="H.264"):
+        video_encoder_args(["mpeg4", "aac"])
+
+
+def test_gdigrab_cmd_uses_desktop_and_even_scale(tmp_path: Path):
+    out = tmp_path / "v.mp4"
+    cmd = build_gdigrab_cmd("ffmpeg", out, ["-c:v", "h264_mf"], fps=30)
+    assert cmd[:5] == ["ffmpeg", "-y", "-f", "gdigrab", "-framerate"]
+    assert "desktop" in cmd
+    assert any("trunc(iw/2)*2" in part for part in cmd)
+    assert str(out) == cmd[-1]
+
+
+def test_mux_cmd_includes_aac_when_audio_present(tmp_path: Path):
+    video = tmp_path / "v.mp4"
+    audio = tmp_path / "a.wav"
+    out = tmp_path / "o.mp4"
+    cmd = build_mux_cmd("ffmpeg", video, out, audio)
+    assert "-c:a" in cmd
+    assert "aac" in cmd
+    assert "+faststart" in cmd
+
+
+def test_mux_cmd_video_only(tmp_path: Path):
+    video = tmp_path / "v.mp4"
+    out = tmp_path / "o.mp4"
+    cmd = build_mux_cmd("ffmpeg", video, out, None)
+    assert "-an" in cmd
+    assert "-c:a" not in cmd
+
+========================================================================
+第十六章  tests/test_screen.py  （螢幕錄影測試）
+檔案：tests/test_screen.py
+========================================================================
+
+"""Tests for screen recording rotation and mux (fake ffmpeg / devices)."""
+
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from music_recorder.capture import LoopbackRecorder
+from music_recorder.screen import (
+    ScreenRecorder,
+    default_screen_filename,
+    unique_output_path,
+)
+from tests.test_capture import DeviceSwitcher, FakePyAudio
+
+
+class FakeGrab:
+    def __init__(self, dest: Path) -> None:
+        dest.write_bytes(b"fake-video")
+        self.stopped = False
+
+    def request_stop(self) -> None:
+        self.stopped = True
+
+    def wait(self, timeout: float) -> None:
+        return None
+
+
+class FakeBackend:
+    def __init__(self) -> None:
+        self.grabs = 0
+        self.mux_calls: list[tuple[Path, Path | None, Path]] = []
+
+    def start_grab(self, dest: Path) -> FakeGrab:
+        self.grabs += 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return FakeGrab(dest)
+
+    def mux(self, video: Path, audio: Path | None, dest: Path) -> None:
+        self.mux_calls.append((video, audio, dest))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"mp4"
+        if audio is not None and audio.exists():
+            payload += b"-a"
+        dest.write_bytes(payload)
+
+
+class SeqClock:
+    def __init__(self) -> None:
+        self.i = 0
+
+    def __call__(self) -> datetime:
+        stamp = datetime(2026, 9, 11, 12, 0, 0) + timedelta(hours=self.i)
+        self.i += 1
+        return stamp
+
+
+def _recorder() -> LoopbackRecorder:
+    return LoopbackRecorder(
+        samplerate=48000,
+        channels=2,
+        poll_interval=1.0,
+        pyaudio_module=FakePyAudio(),
+        device_resolver=DeviceSwitcher().resolve,
+    )
+
+
+def test_default_screen_filename():
+    name = default_screen_filename(datetime(2026, 9, 11, 14, 30, 5))
+    assert name == "screen_20260911_143005.mp4"
+
+
+def test_unique_output_path_adds_suffix(tmp_path: Path):
+    first = unique_output_path(tmp_path, "screen_a.mp4")
+    first.write_bytes(b"x")
+    second = unique_output_path(tmp_path, "screen_a.mp4")
+    assert second != first
+    assert second.name == "screen_a_2.mp4"
+
+
+def test_screen_recorder_stop_saves_last_segment(tmp_path: Path):
+    backend = FakeBackend()
+    out_dir = tmp_path / "desktop"
+    rec = ScreenRecorder(
+        recorder=_recorder(),
+        output_dir=out_dir,
+        segment_seconds=3600,
+        backend=backend,
+        clock=SeqClock(),
+        temp_dir=tmp_path / "tmp",
+    )
+    rec.start()
+    time.sleep(0.25)
+    paths = rec.stop()
+    assert len(paths) == 1
+    assert paths[0].exists()
+    assert paths[0].parent == out_dir
+    assert paths[0].name.startswith("screen_")
+    assert backend.grabs == 1
+    assert len(backend.mux_calls) == 1
+    assert rec.is_recording is False
+
+
+def test_screen_recorder_splits_hourly(tmp_path: Path):
+    backend = FakeBackend()
+    rec = ScreenRecorder(
+        recorder=_recorder(),
+        output_dir=tmp_path / "desktop",
+        segment_seconds=0.35,
+        backend=backend,
+        clock=SeqClock(),
+        temp_dir=tmp_path / "tmp",
+    )
+    rec.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if len(rec.saved_paths) >= 1 and backend.grabs >= 2:
+            break
+        time.sleep(0.05)
+    paths = rec.stop()
+    assert len(paths) >= 2
+    assert all(p.exists() for p in paths)
+    assert backend.grabs >= 2
+    names = [p.name for p in paths]
+    assert len(names) == len(set(names))

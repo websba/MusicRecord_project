@@ -1,0 +1,16 @@
+.venv/
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.log
+Thumbs.db
+desktop.ini
+.cursor
+cursor
+.pytest_cache
+.ruff_cache
+_arena
